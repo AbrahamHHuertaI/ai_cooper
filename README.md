@@ -4,9 +4,10 @@ API REST desarrollada en Node.js para clasificar intenciones de texto usando pro
 
 ## Características
 
-- Clasificación de intenciones basada en similitud de texto
-- Algoritmos de similitud: Jaccard y Levenshtein
-- Normalización de texto (sin acentos, caracteres especiales)
+- Clasificación de intenciones usando **node-nlp** (procesamiento de lenguaje natural avanzado)
+- Detección automática de intenciones con modelos entrenados
+- Soporte multiidioma (configurado para español)
+- Cache inteligente de modelos entrenados para mejor rendimiento
 - Endpoints RESTful para clasificación individual y por lotes
 - Configuración flexible de umbrales de confianza
 
@@ -217,7 +218,7 @@ Puedes enviar tus propios intents en el body de las peticiones `POST /classify` 
 
 - Node.js
 - Express.js
-- Natural (NLP library)
+- node-nlp (Librería de procesamiento de lenguaje natural)
 
 ## Licencia
 

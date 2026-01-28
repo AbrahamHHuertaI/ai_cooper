@@ -1,5 +1,5 @@
 const express = require("express");
-const natural = require("natural");
+const { NlpManager } = require("node-nlp");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -7,104 +7,118 @@ const PORT = process.env.PORT || 3000;
 // Middleware para parsear JSON
 app.use(express.json());
 
-// Función para normalizar texto
-function normalize(text) {
-  return (text || "")
-    .toLowerCase()
-    .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, "") // quita acentos
-    .replace(/[^\p{L}\p{N}\s/.-]/gu, " ") // deja letras/numeros/espacios y / . -
-    .replace(/\s+/g, " ")
-    .trim();
-}
+// Cache de managers entrenados por configuración de intents
+const managerCache = new Map();
 
-// Función para tokenizar texto
-function tokenize(text) {
-  return normalize(text).split(" ").filter(Boolean);
-}
+/**
+ * Crea o recupera un NlpManager entrenado para los intents dados
+ */
+async function getTrainedManager(intents) {
+  // Crear una clave única basada en los intents
+  const cacheKey = JSON.stringify(intents);
+  
+  // Si ya existe en cache, retornarlo
+  if (managerCache.has(cacheKey)) {
+    return managerCache.get(cacheKey);
+  }
 
-// Función para calcular similitud de Jaccard
-function jaccard(tokensA, tokensB) {
-  const A = new Set(tokensA);
-  const B = new Set(tokensB);
-  const inter = [...A].filter(x => B.has(x)).length;
-  const union = new Set([...A, ...B]).size;
-  return union === 0 ? 0 : inter / union;
-}
+  // Crear nuevo manager
+  const manager = new NlpManager({ languages: ['es'], forceNER: true });
+  
+  // Agregar documentos (ejemplos) para cada intent
+  for (const [intentName, examples] of Object.entries(intents)) {
+    for (const example of examples) {
+      manager.addDocument('es', example, intentName);
+    }
+    // Agregar una respuesta genérica para cada intent
+    manager.addAnswer('es', intentName, `Respuesta para ${intentName}`);
+  }
 
-// Función para calcular similitud de Levenshtein
-function levenshteinSim(a, b) {
-  if (!a && !b) return 1;
-  const dist = natural.LevenshteinDistance(a, b);
-  const maxLen = Math.max(a.length, b.length) || 1;
-  return 1 - dist / maxLen; // 0..1
+  // Entrenar el modelo
+  await manager.train();
+  // No guardamos en disco ya que usamos cache en memoria
+  // manager.save();
+
+  // Guardar en cache
+  managerCache.set(cacheKey, manager);
+  
+  return manager;
 }
 
 /**
- * Construye un índice a partir de ejemplos.
+ * Clasifica la intención de un texto usando node-nlp
  */
-function buildIndex(intents) {
-  return Object.entries(intents).map(([intentName, examples]) => {
-    const items = examples.map(ex => {
-      const norm = normalize(ex);
-      return { raw: ex, norm, tokens: tokenize(ex) };
-    });
-    return { intentName, items };
-  });
-}
-
-/**
- * Calcula el score combinado de similitud
- */
-function score(inputNorm, inputTokens, example) {
-  const jac = jaccard(inputTokens, example.tokens);
-  const lev = levenshteinSim(inputNorm, example.norm);
-
-  // bonus si un ejemplo es substring del input o viceversa
-  const contains =
-    inputNorm.includes(example.norm) || example.norm.includes(inputNorm) ? 1 : 0;
-
-  // pesos
-  return 0.55 * jac + 0.35 * lev + 0.10 * contains;
-}
-
-/**
- * Clasifica la intención de un texto
- */
-function classifyIntent(text, index, options = {}) {
+async function classifyIntent(text, intents, options = {}) {
   const {
     threshold = 0.3,     // si baja de esto => unknown
     minMargin = 0.06      // diferencia mínima vs el segundo lugar
   } = options;
 
-  const inputNorm = normalize(text);
-  const inputTokens = tokenize(text);
+  // Normalizar texto para atajos
+  const inputNorm = (text || "")
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .trim();
 
-  // atajos de comandos
+  // Atajos de comandos
   if (inputNorm === "/start") {
     return { intent: "greeting", confidence: 1, matchedExample: "/start" };
   }
 
-  let best = { intent: "unknown", confidence: 0, matchedExample: null };
-  let second = { confidence: 0 };
+  try {
+    // Obtener manager entrenado
+    const manager = await getTrainedManager(intents);
+    
+    // Procesar el texto
+    const result = await manager.process('es', text);
 
-  for (const intent of index) {
-    for (const ex of intent.items) {
-      const s = score(inputNorm, inputTokens, ex);
-      if (s > best.confidence) {
-        second = best;
-        best = { intent: intent.intentName, confidence: s, matchedExample: ex.raw };
-      } else if (s > second.confidence) {
-        second = { intent: intent.intentName, confidence: s, matchedExample: ex.raw };
+    // Extraer la mejor intención y confianza
+    const bestIntent = result.intent || 'unknown';
+    const bestConfidence = result.score || 0;
+    
+    // Encontrar el ejemplo más cercano (usar el primer ejemplo del intent si está disponible)
+    const matchedExample = intents[bestIntent] && intents[bestIntent].length > 0 
+      ? intents[bestIntent][0] 
+      : null;
+
+    // Calcular el segundo mejor resultado
+    // node-nlp puede devolver clasificaciones alternativas en classifications
+    let secondConfidence = 0;
+    if (result.classifications && result.classifications.length > 1) {
+      // Ordenar por score descendente y tomar el segundo
+      const sorted = result.classifications
+        .filter(c => c.intent !== bestIntent)
+        .sort((a, b) => b.score - a.score);
+      if (sorted.length > 0) {
+        secondConfidence = sorted[0].score || 0;
       }
     }
-  }
 
-  const margin = best.confidence - second.confidence;
-  if (best.confidence < threshold || margin < minMargin) {
-    return { intent: "unknown", confidence: best.confidence, matchedExample: best.matchedExample };
+    const margin = bestConfidence - secondConfidence;
+    
+    // Aplicar umbrales
+    if (bestConfidence < threshold || margin < minMargin) {
+      return { 
+        intent: "unknown", 
+        confidence: bestConfidence, 
+        matchedExample: matchedExample 
+      };
+    }
+
+    return {
+      intent: bestIntent,
+      confidence: bestConfidence,
+      matchedExample: matchedExample
+    };
+  } catch (error) {
+    console.error("Error en classifyIntent:", error);
+    return {
+      intent: "unknown",
+      confidence: 0,
+      matchedExample: null
+    };
   }
-  return best;
 }
 
 // Intents predefinidos (puedes moverlos a un archivo de configuración)
@@ -126,9 +140,6 @@ const intents = {
     "Quiero mi recibo", "Necesito mi recibo", "Descargar mi recibo", "Quiero el recibo"
   ]
 };
-
-// Construir el índice al iniciar
-const index = buildIndex(intents);
 
 // ==================== ENDPOINTS ====================
 
@@ -160,7 +171,7 @@ app.get("/intents", (req, res) => {
 });
 
 // Endpoint principal: clasificar intención
-app.post("/classify", (req, res) => {
+app.post("/classify", async (req, res) => {
   try {
     const { text, intents: customIntents, threshold, minMargin } = req.body;
 
@@ -192,16 +203,13 @@ app.post("/classify", (req, res) => {
       }
     }
 
-    // Construir el índice con los intents proporcionados
-    const indexToUse = buildIndex(intentsToUse);
-
     // Opciones personalizadas si se proporcionan
     const options = {};
     if (threshold !== undefined) options.threshold = threshold;
     if (minMargin !== undefined) options.minMargin = minMargin;
 
-    // Clasificar la intención
-    const result = classifyIntent(text, indexToUse, options);
+    // Clasificar la intención usando node-nlp
+    const result = await classifyIntent(text, intentsToUse, options);
 
     res.json({
       text: text,
@@ -218,7 +226,7 @@ app.post("/classify", (req, res) => {
 });
 
 // Endpoint para clasificar múltiples textos a la vez
-app.post("/classify/batch", (req, res) => {
+app.post("/classify/batch", async (req, res) => {
   try {
     const { texts, intents: customIntents, threshold, minMargin } = req.body;
 
@@ -250,19 +258,18 @@ app.post("/classify/batch", (req, res) => {
       }
     }
 
-    // Construir el índice con los intents proporcionados
-    const indexToUse = buildIndex(intentsToUse);
-
     // Opciones personalizadas si se proporcionan
     const options = {};
     if (threshold !== undefined) options.threshold = threshold;
     if (minMargin !== undefined) options.minMargin = minMargin;
 
-    // Clasificar cada texto
-    const results = texts.map(text => ({
-      text: text,
-      result: classifyIntent(text, indexToUse, options)
-    }));
+    // Clasificar cada texto usando Promise.all para procesamiento paralelo
+    const results = await Promise.all(
+      texts.map(async (text) => ({
+        text: text,
+        result: await classifyIntent(text, intentsToUse, options)
+      }))
+    );
 
     res.json({
       results: results,
