@@ -73,7 +73,7 @@ function score(inputNorm, inputTokens, example) {
  */
 function classifyIntent(text, index, options = {}) {
   const {
-    threshold = 0.62,     // si baja de esto => unknown
+    threshold = 0.3,     // si baja de esto => unknown
     minMargin = 0.06      // diferencia mínima vs el segundo lugar
   } = options;
 
